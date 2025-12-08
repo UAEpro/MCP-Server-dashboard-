@@ -3,9 +3,12 @@ import glob
 import json
 import os
 import sys
-from dataclasses import dataclass, asdict
+import psutil
+from dataclasses import dataclass, asdict, field
 from typing import List, Optional, Dict
 from nicegui import ui, app
+from mcp import ClientSession
+from mcp.client.sse import sse_client
 
 # Ensure mcp_servers directory exists
 if not os.path.exists("mcp_servers"):
@@ -20,6 +23,8 @@ class ServerConfig:
     ssl_key_path: str = ""
     cwd: str = "" # Custom working directory
     source_type: str = "local" # 'local' (mcp_servers/) or 'imported'
+    env: Dict[str, str] = field(default_factory=dict)
+    auto_restart: bool = False
 
 CONFIG_FILE = "mcp_servers/config.json"
 LOG_DIR = "logs"
@@ -73,9 +78,67 @@ class Server:
         self.status_indicator = None
         self.status_label = None
 
+        # Metrics
+        self.cpu_history: List[float] = []
+        self.mem_history: List[float] = []
+        self.metrics_chart = None
+
+        # Start background health monitor for this server
+        ui.timer(5.0, self.check_health)
+        ui.timer(2.0, self.update_metrics)
+
     @property
     def is_running(self):
         return self.process is not None and self.process.returncode is None
+
+    async def check_health(self):
+        if self.process:
+            if self.process.returncode is None:
+                try:
+                    # Check if actually alive by sending signal 0 (no-op)
+                    self.process.send_signal(0)
+                except ProcessLookupError:
+                    self.log("Process died unexpectedly.")
+                    # It's dead, let's treat it as closed
+                    self.process = None
+
+            # Check if we need to restart
+            # If self.process is None (we cleared it above or previously) OR it has a returncode (stopped normally/crashed)
+            if (self.process is None or self.process.returncode is not None) and self.config.auto_restart:
+                 self.log(f"Auto-restarting server...")
+                 self.process = None # Ensure clean state
+                 await self.start()
+
+    async def update_metrics(self):
+        if not self.is_running or not self.process:
+            return
+
+        try:
+            # pid property is available on asyncio subprocess
+            pid = self.process.pid
+            proc = psutil.Process(pid)
+
+            # cpu_percent needs interval=None to be non-blocking (returns diff since last call)
+            # But first call returns 0.0. We call it repeatedly every 2s.
+            cpu = proc.cpu_percent(interval=None)
+            mem_info = proc.memory_info()
+            mem_mb = mem_info.rss / 1024 / 1024
+
+            self.cpu_history.append(cpu)
+            self.mem_history.append(mem_mb)
+
+            # Keep last 60 points (2 minutes)
+            if len(self.cpu_history) > 60:
+                self.cpu_history.pop(0)
+                self.mem_history.pop(0)
+
+            if self.metrics_chart:
+                 self.metrics_chart.options['series'][0]['data'] = self.cpu_history
+                 self.metrics_chart.options['series'][1]['data'] = self.mem_history
+                 self.metrics_chart.update()
+
+        except Exception:
+            pass
 
     async def start(self):
         if self.is_running:
@@ -119,12 +182,17 @@ class Server:
         self.log(f"Starting server with command: {' '.join(cmd)}")
         self.log(f"Working Directory: {exec_cwd}")
 
+        # Prepare environment variables
+        env = os.environ.copy()
+        env.update(self.config.env)
+
         try:
             self.process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=exec_cwd
+                cwd=exec_cwd,
+                env=env
             )
             self.log(f"Server started with PID: {self.process.pid}")
 
@@ -398,37 +466,45 @@ def logs_page():
         log_files = glob.glob(os.path.join(LOG_DIR, "*.log"))
         log_files_bases = [os.path.basename(f) for f in log_files]
 
-        selected_log = ui.select(log_files_bases, label='Select Log File', value=log_files_bases[0] if log_files_bases else None).classes('w-64')
+        if not log_files:
+            ui.label("No log files found.").classes('text-slate-500 italic')
 
-        log_view = ui.scroll_area().classes('w-full flex-grow bg-slate-900 text-slate-300 p-4 font-mono h-[600px] rounded')
+        else:
+            selected_log = ui.select(log_files_bases, label='Select Log File', value=log_files_bases[0] if log_files_bases else None).classes('w-64')
 
-        def refresh_log():
-            log_view.clear()
-            if not selected_log.value:
-                with log_view:
-                    ui.label("No log file selected.")
-                return
+            log_view = ui.scroll_area().classes('w-full flex-grow bg-slate-900 text-slate-300 p-4 font-mono h-[600px] rounded')
 
-            filepath = os.path.join(LOG_DIR, selected_log.value)
-            if os.path.exists(filepath):
-                with open(filepath, 'r') as f:
-                    content = f.read()
+            def refresh_log():
+                log_view.clear()
+                if not selected_log.value:
                     with log_view:
-                        ui.label(content).style('white-space: pre-wrap;')
-            else:
-                with log_view:
-                     ui.label("File not found.")
+                        ui.label("No log file selected.")
+                    return
 
-        selected_log.on_value_change(refresh_log)
-        ui.button('Refresh', on_click=refresh_log).props('icon=refresh')
+                filepath = os.path.join(LOG_DIR, selected_log.value)
+                if os.path.exists(filepath):
+                    with open(filepath, 'r') as f:
+                        content = f.read()
+                        with log_view:
+                            ui.label(content).style('white-space: pre-wrap;')
+                else:
+                    with log_view:
+                        ui.label("File not found.")
 
-        # Initial load
-        refresh_log()
+            selected_log.on_value_change(refresh_log)
+            ui.button('Refresh', on_click=refresh_log).props('icon=refresh')
+
+            # Initial load
+            refresh_log()
 
 @ui.page('/settings')
 def settings_page():
     app.storage.user['page'] = '/settings'
     layout()
+
+    # Ensure servers are loaded
+    if not servers:
+        scan_servers()
 
     with ui.column().classes('w-full p-8 bg-slate-100 min-h-screen gap-6'):
         ui.label('Configuration').classes('text-2xl font-bold text-slate-800')
@@ -436,21 +512,24 @@ def settings_page():
         with ui.card().classes('w-full p-6'):
             ui.label('Tracked Servers').classes('text-lg font-bold q-mb-md')
 
-            # Simple table or list
-            for server in servers:
-                with ui.row().classes('w-full items-center justify-between p-2 border-b border-slate-100'):
-                    with ui.column().classes('gap-0'):
-                        ui.label(server.name).classes('font-bold')
-                        ui.label(server.filepath).classes('text-xs text-slate-500')
+            if not servers:
+                 ui.label("No servers tracked.").classes('text-slate-500 italic')
+            else:
+                # Simple table or list
+                for server in servers:
+                    with ui.row().classes('w-full items-center justify-between p-2 border-b border-slate-100'):
+                        with ui.column().classes('gap-0'):
+                            ui.label(server.name).classes('font-bold')
+                            ui.label(server.filepath).classes('text-xs text-slate-500')
 
-                    with ui.row().classes('items-center gap-4'):
-                        ui.label(f"Port: {server.config.port}").classes('text-sm')
-                        if server.config.source_type == 'imported':
-                            ui.chip('Imported', color='blue-100', text_color='blue-800').props('dense')
-                            # Ability to remove imported servers
-                            ui.button(icon='delete', color='red', on_click=lambda s=server: remove_server(s)).props('flat round dense').tooltip('Forget Server')
-                        else:
-                            ui.chip('Local', color='green-100', text_color='green-800').props('dense')
+                        with ui.row().classes('items-center gap-4'):
+                            ui.label(f"Port: {server.config.port}").classes('text-sm')
+                            if server.config.source_type == 'imported':
+                                ui.chip('Imported', color='blue-100', text_color='blue-800').props('dense')
+                                # Ability to remove imported servers
+                                ui.button(icon='delete', color='red', on_click=lambda s=server: remove_server(s)).props('flat round dense').tooltip('Forget Server')
+                            else:
+                                ui.chip('Local', color='green-100', text_color='green-800').props('dense')
 
 def remove_server(server: Server):
     if server.is_running:
@@ -511,6 +590,8 @@ def server_grid():
 
                 # Card Footer (Tools)
                 with ui.row().classes('w-full p-2 bg-slate-50 border-t border-slate-100 justify-end gap-2'):
+                    ui.button(icon='bug_report', on_click=lambda s=server: open_inspector_dialog(s)).props('flat round dense color=slate-500').tooltip('Inspector')
+                    ui.button(icon='show_chart', on_click=lambda s=server: open_metrics_dialog(s)).props('flat round dense color=slate-500').tooltip('Metrics')
                     ui.button(icon='settings', on_click=lambda s=server: open_config_dialog(s)).props('flat round dense color=slate-500').tooltip('Configure')
                     ui.button(icon='article', on_click=lambda s=server: open_log_dialog(s)).props('flat round dense color=slate-500').tooltip('View Logs')
 
@@ -538,12 +619,57 @@ def open_config_dialog(server: Server):
                 use_https = ui.switch('', value=server.config.use_https,
                                       on_change=lambda e: update_config('use_https', e.value))
 
+            with ui.row().classes('items-center justify-between w-full border p-3 rounded border-slate-200'):
+                ui.label('Auto Restart').classes('text-slate-700 font-medium')
+                ui.switch('', value=server.config.auto_restart,
+                          on_change=lambda e: update_config('auto_restart', e.value))
+
             with ui.column().classes('w-full gap-2').bind_visibility_from(use_https, 'value'):
                 ui.label('SSL Certificates').classes('text-xs font-bold text-slate-400 uppercase tracking-wider')
                 ui.input('Cert Path', value=server.config.ssl_cert_path,
                          on_change=lambda e: update_config('ssl_cert_path', e.value)).classes('w-full').props('outlined dense')
                 ui.input('Key Path', value=server.config.ssl_key_path,
                          on_change=lambda e: update_config('ssl_key_path', e.value)).classes('w-full').props('outlined dense')
+
+            ui.separator().classes('my-2')
+            ui.label('Environment Variables').classes('text-lg font-bold text-slate-800')
+
+            # Env var editor
+            env_container = ui.column().classes('w-full gap-2')
+
+            def refresh_env_list():
+                env_container.clear()
+                with env_container:
+                    if not server.config.env:
+                        ui.label('No environment variables set.').classes('text-slate-500 italic text-sm')
+
+                    for key, val in server.config.env.items():
+                        with ui.row().classes('w-full items-center gap-2'):
+                            ui.label(f"{key}").classes('font-mono font-bold text-slate-700')
+                            ui.label('=').classes('text-slate-400')
+                            ui.label(f"{val}").classes('font-mono text-slate-600 truncate flex-grow')
+                            ui.button(icon='delete', on_click=lambda k=key: remove_env(k)).props('flat round dense color=red size=sm')
+
+            def add_env(key, val):
+                if not key: return
+                server.config.env[key] = val
+                save_configs()
+                refresh_env_list()
+                new_key.value = ''
+                new_val.value = ''
+
+            def remove_env(key):
+                if key in server.config.env:
+                    del server.config.env[key]
+                    save_configs()
+                    refresh_env_list()
+
+            refresh_env_list()
+
+            with ui.row().classes('w-full items-center gap-2'):
+                new_key = ui.input(placeholder='KEY').props('outlined dense').classes('flex-1')
+                new_val = ui.input(placeholder='VALUE').props('outlined dense').classes('flex-1')
+                ui.button(icon='add', on_click=lambda: add_env(new_key.value, new_val.value)).props('flat round dense color=green')
 
         with ui.row().classes('w-full justify-end q-mt-lg'):
             ui.button('Done', on_click=dialog.close, color='blue-600').props('unelevated no-caps')
@@ -566,6 +692,131 @@ def open_log_dialog(server: Server):
         with server.log_container:
             for log in server.logs:
                 ui.label(log).style('font-family: "Fira Code", monospace; font-size: 0.85rem; line-height: 1.2; color: #d4d4d4;')
+
+    dialog.open()
+
+async def open_inspector_dialog(server: Server):
+    with ui.dialog() as dialog, ui.card().classes('w-[900px] h-[700px] p-0 flex flex-col'):
+        # Header
+        with ui.row().classes('w-full items-center justify-between p-4 bg-slate-900 text-white'):
+            with ui.row().classes('items-center gap-2'):
+                ui.icon('bug_report', size='sm')
+                ui.label(f'{server.name} - Inspector').classes('font-bold')
+            ui.button(icon='close', on_click=dialog.close).props('flat round dense color=white')
+
+        content_area = ui.column().classes('w-full flex-grow p-6 overflow-auto gap-6')
+
+        if not server.is_running:
+            with content_area:
+                 ui.label("Server must be running to inspect.").classes("text-red-500 italic")
+            dialog.open()
+            return
+
+        with content_area:
+            ui.spinner(size='lg').classes('self-center')
+
+        dialog.open()
+
+        # Async load tools
+        try:
+            url = f"http://localhost:{server.config.port}/sse"
+            async with sse_client(url) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    tools_result = await session.list_tools()
+                    tools = tools_result.tools
+
+                    content_area.clear()
+                    with content_area:
+                        if not tools:
+                            ui.label("No tools found.").classes("text-slate-500 italic")
+
+                        for tool in tools:
+                            with ui.card().classes('w-full border border-slate-200 p-4'):
+                                ui.label(tool.name).classes('text-lg font-bold text-slate-800')
+                                ui.label(tool.description).classes('text-sm text-slate-500 q-mb-md')
+
+                                # Inputs for arguments
+                                args_inputs = {}
+                                if tool.inputSchema and 'properties' in tool.inputSchema:
+                                    with ui.grid(columns=2).classes('w-full gap-4 q-mb-md'):
+                                        for prop_name, prop_schema in tool.inputSchema['properties'].items():
+                                            prop_type = prop_schema.get('type', 'string')
+                                            label = f"{prop_name} ({prop_type})"
+                                            if prop_type == 'integer' or prop_type == 'number':
+                                                args_inputs[prop_name] = ui.number(label).props('outlined dense')
+                                            else:
+                                                args_inputs[prop_name] = ui.input(label).props('outlined dense')
+
+                                result_area = ui.label('').classes('whitespace-pre-wrap font-mono bg-slate-100 p-2 rounded text-xs hidden w-full')
+
+                                async def run_tool(t_name=tool.name, t_inputs=args_inputs, r_area=result_area):
+                                    # Collect args
+                                    args = {}
+                                    for k, v in t_inputs.items():
+                                        if v.value is not None and v.value != '':
+                                            args[k] = v.value
+
+                                    r_area.classes(remove='hidden')
+                                    r_area.text = "Running..."
+
+                                    try:
+                                        # Re-connect for execution
+                                        async with sse_client(url) as (read_exec, write_exec):
+                                            async with ClientSession(read_exec, write_exec) as exec_session:
+                                                await exec_session.initialize()
+                                                res = await exec_session.call_tool(t_name, arguments=args)
+
+                                                # Parse result (it's a CallToolResult object)
+                                                output_text = ""
+                                                for content in res.content:
+                                                    if content.type == 'text':
+                                                        output_text += content.text
+                                                    else:
+                                                        output_text += f"[{content.type} content]"
+
+                                                r_area.text = output_text
+                                                if res.isError:
+                                                    r_area.classes('text-red-600')
+                                                else:
+                                                    r_area.classes('text-slate-700')
+
+                                    except Exception as e:
+                                        r_area.text = f"Error: {e}"
+                                        r_area.classes('text-red-600')
+
+                                ui.button('Run Tool', on_click=run_tool).props('unelevated no-caps color=blue-600')
+
+                                # Re-add result area to layout so it appears below button
+                                result_area.move(result_area.parent_slot)
+
+        except Exception as e:
+            content_area.clear()
+            with content_area:
+                 ui.label(f"Failed to connect to inspector: {e}").classes("text-red-500")
+
+def open_metrics_dialog(server: Server):
+    with ui.dialog() as dialog, ui.card().classes('w-[600px] p-6'):
+        with ui.row().classes('w-full items-center justify-between q-mb-md'):
+            ui.label(f'{server.name} - Live Metrics').classes('text-xl font-bold text-slate-800')
+            ui.button(icon='close', on_click=dialog.close).props('flat round dense color=grey')
+
+        if not server.is_running:
+            ui.label("Server is not running.").classes("text-slate-500 italic")
+        else:
+            server.metrics_chart = ui.echart({
+                'tooltip': {'trigger': 'axis'},
+                'legend': {'data': ['CPU %', 'Memory (MB)']},
+                'xAxis': {'type': 'category', 'boundaryGap': False, 'data': list(range(60))},
+                'yAxis': [
+                    {'type': 'value', 'name': 'CPU %', 'min': 0, 'max': 100},
+                    {'type': 'value', 'name': 'Memory (MB)', 'min': 0}
+                ],
+                'series': [
+                    {'name': 'CPU %', 'type': 'line', 'data': server.cpu_history, 'smooth': True, 'showSymbol': False},
+                    {'name': 'Memory (MB)', 'type': 'line', 'yAxisIndex': 1, 'data': server.mem_history, 'smooth': True, 'showSymbol': False}
+                ]
+            }).classes('w-full h-64')
 
     dialog.open()
 

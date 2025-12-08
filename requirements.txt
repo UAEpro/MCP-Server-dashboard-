@@ -1,3 +1,4 @@
 nicegui
 fastmcp
 uvicorn
+psutil
