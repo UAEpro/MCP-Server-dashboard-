@@ -18,8 +18,14 @@ class ServerConfig:
     use_https: bool = False
     ssl_cert_path: str = ""
     ssl_key_path: str = ""
+    cwd: str = "" # Custom working directory
+    source_type: str = "local" # 'local' (mcp_servers/) or 'imported'
 
 CONFIG_FILE = "mcp_servers/config.json"
+LOG_DIR = "logs"
+
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
 
 def load_configs() -> Dict[str, dict]:
     if os.path.exists(CONFIG_FILE):
@@ -33,7 +39,11 @@ def load_configs() -> Dict[str, dict]:
 def save_configs():
     data = {}
     for server in servers:
+        # Update config with current path in case it changed (re-import?)
+        # For now, just save the config object
         data[server.name] = asdict(server.config)
+        # We also need to save the filepath for imported servers so we can restore them
+        data[server.name]['filepath'] = server.filepath
 
     with open(CONFIG_FILE, 'w') as f:
         json.dump(data, f, indent=4)
@@ -42,10 +52,21 @@ class Server:
     def __init__(self, filepath: str, saved_config: dict = None):
         self.filepath = filepath
         self.name = os.path.basename(filepath).replace(".py", "")
+
         if saved_config:
+            # Handle migration/extra fields safely
+            # Pop 'filepath' if it exists in saved_config to avoid __init__ error if not in ServerConfig
+            if 'filepath' in saved_config:
+                saved_config.pop('filepath')
             self.config = ServerConfig(**saved_config)
         else:
             self.config = ServerConfig()
+            # Default CWD logic
+            if self.config.source_type == 'local':
+                self.config.cwd = os.getcwd()
+            else:
+                self.config.cwd = os.path.dirname(filepath)
+
         self.process: Optional[asyncio.subprocess.Process] = None
         self.logs: List[str] = []
         self.log_container = None
@@ -60,9 +81,28 @@ class Server:
         if self.is_running:
             return
 
+        # Determine execution details
+        cwd = self.config.cwd if self.config.cwd else os.getcwd()
+
+        # Construct import path
+        # If local in mcp_servers, we use module syntax: mcp_servers.name:app
+        # If imported/external, we rely on having CWD set to the script's folder,
+        # and then just importing "filename:app"
+
+        if self.config.source_type == 'local':
+             # It's in mcp_servers/, so we run from repo root
+             import_str = f"mcp_servers.{self.name}:{self.config.app_name}"
+             exec_cwd = os.getcwd()
+        else:
+             # It's external. We set CWD to the file's directory.
+             # Import string is just the filename without .py
+             filename_no_ext = os.path.basename(self.filepath).replace(".py", "")
+             import_str = f"{filename_no_ext}:{self.config.app_name}"
+             exec_cwd = cwd
+
         cmd = [
             sys.executable, "-m", "uvicorn",
-            f"mcp_servers.{self.name}:{self.config.app_name}",
+            import_str,
             "--host", "0.0.0.0",
             "--port", str(self.config.port)
         ]
@@ -77,13 +117,14 @@ class Server:
                 return
 
         self.log(f"Starting server with command: {' '.join(cmd)}")
+        self.log(f"Working Directory: {exec_cwd}")
 
         try:
             self.process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=os.getcwd()
+                cwd=exec_cwd
             )
             self.log(f"Server started with PID: {self.process.pid}")
 
@@ -125,6 +166,15 @@ class Server:
 
     def log(self, message: str):
         self.logs.append(message)
+
+        # Write to file
+        try:
+            log_file = os.path.join(LOG_DIR, f"{self.name}.log")
+            with open(log_file, "a") as f:
+                f.write(f"{message}\n")
+        except Exception:
+            pass # Don't crash on logging fail
+
         if self.log_container:
             try:
                 # Check if the container is still on a valid page/client
@@ -154,14 +204,43 @@ servers: List[Server] = []
 
 def scan_servers():
     global servers
-    files = glob.glob("mcp_servers/*.py")
-    current_filepaths = {s.filepath for s in servers}
     saved_configs = load_configs()
 
+    # Track which servers we've already loaded/found
+    processed_names = set()
+    current_server_map = {s.name: s for s in servers}
+    new_servers = []
+
+    # 1. Process explicit/imported servers from config
+    for name, config in saved_configs.items():
+        if 'filepath' in config and config.get('source_type') == 'imported':
+            processed_names.add(name)
+            filepath = config['filepath']
+            if name in current_server_map:
+                continue # Already loaded
+
+            # Verify file exists
+            if os.path.exists(filepath):
+                 new_servers.append(Server(filepath, config))
+            else:
+                print(f"Warning: Imported server {name} not found at {filepath}")
+
+    # 2. Scan local mcp_servers/ directory
+    files = glob.glob("mcp_servers/*.py")
     for f in files:
-        if f not in current_filepaths:
-            name = os.path.basename(f).replace(".py", "")
-            servers.append(Server(f, saved_configs.get(name)))
+        name = os.path.basename(f).replace(".py", "")
+        if name in processed_names:
+            continue # Already handled (unlikely unless config overlaps)
+
+        if name in current_server_map:
+            continue # Already loaded
+
+        # It's a local server
+        config = saved_configs.get(name, {})
+        config['source_type'] = 'local'
+        new_servers.append(Server(f, config))
+
+    servers.extend(new_servers)
 
 scan_servers()
 
@@ -220,15 +299,15 @@ def layout():
     # Sidebar
     with ui.left_drawer(value=True).classes('bg-slate-50 border-r border-slate-200').props('width=240'):
         with ui.column().classes('w-full py-4'):
-            def nav_item(label, icon, active=False):
+            def nav_item(label, link, icon, active=False):
                 bg_color = 'bg-blue-50 text-blue-600' if active else 'text-slate-600 hover:bg-slate-100'
-                with ui.row().classes(f'w-full items-center gap-4 px-6 py-3 cursor-pointer transition-colors {bg_color}'):
+                with ui.row().classes(f'w-full items-center gap-4 px-6 py-3 cursor-pointer transition-colors {bg_color}').on('click', lambda: ui.open(link)):
                     ui.icon(icon, size='sm')
                     ui.label(label).classes('font-medium')
 
-            nav_item('Dashboard', 'dashboard', active=True)
-            # nav_item('Configuration', 'settings') # Future global settings
-            # nav_item('Logs', 'history') # Future global logs
+            nav_item('Dashboard', '/', icon='dashboard', active=app.storage.user.get('page') == '/')
+            nav_item('Settings', '/settings', icon='settings', active=app.storage.user.get('page') == '/settings')
+            nav_item('Logs', '/logs', icon='history', active=app.storage.user.get('page') == '/logs')
 
             ui.separator().classes('my-4')
 
@@ -241,6 +320,7 @@ def layout():
 
 @ui.page('/')
 def main_page():
+    app.storage.user['page'] = '/'
     layout()
 
     with ui.column().classes('w-full p-8 bg-slate-100 min-h-screen gap-6'):
@@ -255,18 +335,133 @@ def main_page():
         # Server Grid
         server_grid()
 
+def import_server(path: str, app_name: str):
+    if not path or not os.path.exists(path):
+        ui.notify("File path does not exist", type='negative')
+        return
+
+    name = os.path.basename(path).replace(".py", "")
+
+    # Check for duplicates
+    for s in servers:
+        if s.name == name:
+            ui.notify(f"Server with name {name} already exists", type='negative')
+            return
+
+    # Create config for imported server
+    new_server = Server(path)
+    new_server.config.app_name = app_name
+    new_server.config.source_type = 'imported'
+    new_server.config.cwd = os.path.dirname(path)
+
+    servers.append(new_server)
+    save_configs()
+    server_grid.refresh()
+    ui.notify(f"Imported {name}", type='positive')
+
 def open_new_server_dialog():
-    with ui.dialog() as dialog, ui.card().classes('w-96 p-6'):
+    with ui.dialog() as dialog, ui.card().classes('w-[500px] p-6'):
         with ui.row().classes('w-full items-center justify-between q-mb-md'):
-            ui.label('Create New Server').classes('text-xl font-bold text-slate-800')
+            ui.label('Add Server').classes('text-xl font-bold text-slate-800')
             ui.button(icon='close', on_click=dialog.close).props('flat round dense color=grey')
 
-        name_input = ui.input('Server Name', placeholder='e.g. Weather Agent').classes('w-full').props('outlined dense autofocus')
+        with ui.tabs().classes('w-full text-blue-600') as tabs:
+            create_tab = ui.tab('Create New')
+            import_tab = ui.tab('Import Existing')
 
-        with ui.row().classes('w-full justify-end q-mt-lg'):
-            ui.button('Create', on_click=lambda: (create_new_server(name_input.value), dialog.close()), color='blue-600').props('unelevated no-caps')
+        with ui.tab_panels(tabs, value=create_tab).classes('w-full'):
+            with ui.tab_panel(create_tab):
+                ui.label('Create a new FastMCP server in mcp_servers/').classes('text-sm text-slate-500 q-mb-md')
+                name_input = ui.input('Server Name', placeholder='e.g. Weather Agent').classes('w-full').props('outlined dense autofocus')
+                with ui.row().classes('w-full justify-end q-mt-lg'):
+                    ui.button('Create', on_click=lambda: (create_new_server(name_input.value), dialog.close()), color='blue-600').props('unelevated no-caps')
+
+            with ui.tab_panel(import_tab):
+                ui.label('Import an existing Python script from anywhere').classes('text-sm text-slate-500 q-mb-md')
+                path_input = ui.input('Script Path', placeholder='/path/to/main.py').classes('w-full').props('outlined dense')
+                app_input = ui.input('App Instance Name', value='mcp', placeholder='e.g. mcp').classes('w-full').props('outlined dense')
+
+                with ui.row().classes('w-full justify-end q-mt-lg'):
+                    ui.button('Import', on_click=lambda: (import_server(path_input.value, app_input.value), dialog.close()), color='blue-600').props('unelevated no-caps')
 
     dialog.open()
+
+@ui.page('/logs')
+def logs_page():
+    app.storage.user['page'] = '/logs'
+    layout()
+
+    with ui.column().classes('w-full p-8 bg-slate-100 min-h-screen gap-6'):
+        ui.label('Server Logs').classes('text-2xl font-bold text-slate-800')
+
+        # Log File Selection
+        log_files = glob.glob(os.path.join(LOG_DIR, "*.log"))
+        log_files_bases = [os.path.basename(f) for f in log_files]
+
+        selected_log = ui.select(log_files_bases, label='Select Log File', value=log_files_bases[0] if log_files_bases else None).classes('w-64')
+
+        log_view = ui.scroll_area().classes('w-full flex-grow bg-slate-900 text-slate-300 p-4 font-mono h-[600px] rounded')
+
+        def refresh_log():
+            log_view.clear()
+            if not selected_log.value:
+                with log_view:
+                    ui.label("No log file selected.")
+                return
+
+            filepath = os.path.join(LOG_DIR, selected_log.value)
+            if os.path.exists(filepath):
+                with open(filepath, 'r') as f:
+                    content = f.read()
+                    with log_view:
+                        ui.label(content).style('white-space: pre-wrap;')
+            else:
+                with log_view:
+                     ui.label("File not found.")
+
+        selected_log.on_value_change(refresh_log)
+        ui.button('Refresh', on_click=refresh_log).props('icon=refresh')
+
+        # Initial load
+        refresh_log()
+
+@ui.page('/settings')
+def settings_page():
+    app.storage.user['page'] = '/settings'
+    layout()
+
+    with ui.column().classes('w-full p-8 bg-slate-100 min-h-screen gap-6'):
+        ui.label('Configuration').classes('text-2xl font-bold text-slate-800')
+
+        with ui.card().classes('w-full p-6'):
+            ui.label('Tracked Servers').classes('text-lg font-bold q-mb-md')
+
+            # Simple table or list
+            for server in servers:
+                with ui.row().classes('w-full items-center justify-between p-2 border-b border-slate-100'):
+                    with ui.column().classes('gap-0'):
+                        ui.label(server.name).classes('font-bold')
+                        ui.label(server.filepath).classes('text-xs text-slate-500')
+
+                    with ui.row().classes('items-center gap-4'):
+                        ui.label(f"Port: {server.config.port}").classes('text-sm')
+                        if server.config.source_type == 'imported':
+                            ui.chip('Imported', color='blue-100', text_color='blue-800').props('dense')
+                            # Ability to remove imported servers
+                            ui.button(icon='delete', color='red', on_click=lambda s=server: remove_server(s)).props('flat round dense').tooltip('Forget Server')
+                        else:
+                            ui.chip('Local', color='green-100', text_color='green-800').props('dense')
+
+def remove_server(server: Server):
+    if server.is_running:
+        ui.notify("Stop server before removing", type='negative')
+        return
+
+    if server in servers:
+        servers.remove(server)
+        save_configs() # This will remove it from config file since it iterates 'servers'
+        ui.notify(f"Removed {server.name}", type='positive')
+        ui.open('/settings') # Refresh page
 
 @ui.refreshable
 def server_grid():
@@ -376,4 +571,4 @@ def open_log_dialog(server: Server):
 
 
 if __name__ in {"__main__", "__mp_main__"}:
-    ui.run(title="MCP Enterprise Manager", port=8080)
+    ui.run(title="MCP Enterprise Manager", port=8080, storage_secret='mcp-dashboard-secret')
