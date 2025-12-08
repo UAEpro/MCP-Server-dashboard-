@@ -2,7 +2,7 @@ import asyncio
 import glob
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 from nicegui import ui, app
 
@@ -26,6 +26,7 @@ class Server:
         self.process: Optional[asyncio.subprocess.Process] = None
         self.logs: List[str] = []
         self.log_container = None
+        self.status_indicator = None
         self.status_label = None
 
     @property
@@ -49,12 +50,12 @@ class Server:
                 cmd.extend(["--ssl-keyfile", self.config.ssl_key_path])
             else:
                 self.log("Error: HTTPS selected but cert/key paths missing.")
+                ui.notify('HTTPS Error: Cert/Key paths missing', type='negative')
                 return
 
         self.log(f"Starting server with command: {' '.join(cmd)}")
 
         try:
-            # Set cwd to current directory so python can find mcp_servers module
             self.process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -63,14 +64,16 @@ class Server:
             )
             self.log(f"Server started with PID: {self.process.pid}")
 
-            # Start background tasks to read logs
             asyncio.create_task(self._read_stream(self.process.stdout, "STDOUT"))
             asyncio.create_task(self._read_stream(self.process.stderr, "STDERR"))
 
             self.update_ui_state()
+            ui.notify(f'{self.name} started', type='positive')
 
         except Exception as e:
-            self.log(f"Failed to start server: {e}")
+            msg = f"Failed to start server: {e}"
+            self.log(msg)
+            ui.notify(msg, type='negative')
 
     async def stop(self):
         if not self.is_running:
@@ -81,6 +84,7 @@ class Server:
             self.process.terminate()
             await self.process.wait()
             self.log("Server stopped.")
+            ui.notify(f'{self.name} stopped', type='info')
         except Exception as e:
             self.log(f"Error stopping server: {e}")
         finally:
@@ -99,14 +103,28 @@ class Server:
     def log(self, message: str):
         self.logs.append(message)
         if self.log_container:
-            with self.log_container:
-                ui.label(message).style('font-family: monospace; white-space: pre-wrap;')
-            self.log_container.scroll_to(percent=1.0)
+            try:
+                # Check if the container is still on a valid page/client
+                if self.log_container.client.has_socket_connection:
+                    with self.log_container:
+                        # Terminal style log line
+                        ui.label(message).style('font-family: "Fira Code", monospace; font-size: 0.85rem; line-height: 1.2;')
+                    self.log_container.scroll_to(percent=1.0)
+                else:
+                    self.log_container = None
+            except Exception:
+                # If element is deleted or client disconnected, clear the reference
+                self.log_container = None
 
     def update_ui_state(self):
+        # Update the specific UI elements for this server
+        if self.status_indicator:
+            color = 'green' if self.is_running else 'grey'
+            self.status_indicator.props(f'color={color}')
+
         if self.status_label:
-            self.status_label.text = "Running" if self.is_running else "Stopped"
-            self.status_label.classes(replace='text-green' if self.is_running else 'text-red')
+            self.status_label.text = "RUNNING" if self.is_running else "STOPPED"
+            self.status_label.classes(replace='text-green-500' if self.is_running else 'text-grey-500')
 
 
 servers: List[Server] = []
@@ -122,50 +140,162 @@ def scan_servers():
 
 scan_servers()
 
-# -- UI --
+# -- UI Components --
+
+def layout():
+    # Header
+    with ui.header().classes('bg-slate-900 text-white shadow-lg items-center px-4 h-16'):
+        with ui.row().classes('items-center gap-2'):
+            ui.icon('dns', size='md').classes('text-blue-400')
+            ui.label('MCP Enterprise Manager').classes('text-xl font-semibold tracking-wide')
+
+        ui.space()
+
+        with ui.row().classes('items-center gap-4'):
+             ui.button(icon='refresh', on_click=lambda: (scan_servers(), server_grid.refresh())).props('flat round dense color=white').tooltip('Rescan Servers')
+             ui.button(icon='dark_mode', on_click=lambda: ui.dark_mode().toggle()).props('flat round dense color=white').tooltip('Toggle Dark Mode')
+             ui.avatar(icon='person', color='blue-grey-8', text_color='white').props('size=sm')
+
+    # Sidebar
+    with ui.left_drawer(value=True).classes('bg-slate-50 border-r border-slate-200').props('width=240'):
+        with ui.column().classes('w-full py-4'):
+            def nav_item(label, icon, active=False):
+                bg_color = 'bg-blue-50 text-blue-600' if active else 'text-slate-600 hover:bg-slate-100'
+                with ui.row().classes(f'w-full items-center gap-4 px-6 py-3 cursor-pointer transition-colors {bg_color}'):
+                    ui.icon(icon, size='sm')
+                    ui.label(label).classes('font-medium')
+
+            nav_item('Dashboard', 'dashboard', active=True)
+            nav_item('Configuration', 'settings')
+            nav_item('Logs', 'history')
+            nav_item('Users', 'group')
+
+            ui.separator().classes('my-4')
+
+            with ui.row().classes('w-full px-6'):
+                ui.label('SYSTEM STATUS').classes('text-xs font-bold text-slate-400 tracking-wider')
+            with ui.row().classes('w-full px-6 py-2 items-center gap-2'):
+                ui.element('div').classes('w-2 h-2 rounded-full bg-green-500')
+                ui.label('System Online').classes('text-xs text-slate-500')
+
 
 @ui.page('/')
 def main_page():
-    ui.label('MCP Server Dashboard').classes('text-2xl font-bold q-mb-md')
+    layout()
 
-    ui.button('Scan for Servers', on_click=lambda: (scan_servers(), server_list.refresh())).classes('q-mb-md')
+    with ui.column().classes('w-full p-8 bg-slate-100 min-h-screen gap-6'):
+        # Page Title
+        with ui.row().classes('w-full justify-between items-center'):
+            with ui.column().classes('gap-1'):
+                ui.label('Server Overview').classes('text-2xl font-bold text-slate-800')
+                ui.label('Manage and monitor your MCP instances').classes('text-sm text-slate-500')
 
-    @ui.refreshable
-    def server_list():
-        if not servers:
-            ui.label("No servers found in mcp_servers/").classes("text-gray-500 italic")
-            return
+            ui.button('New Server', icon='add', color='blue-600').props('unelevated no-caps')
 
+        # Server Grid
+        server_grid()
+
+@ui.refreshable
+def server_grid():
+    if not servers:
+        with ui.column().classes('w-full items-center justify-center py-20 text-slate-400 gap-4'):
+            ui.icon('dns', size='4xl')
+            ui.label('No servers found. Add files to mcp_servers/').classes('text-lg')
+        return
+
+    with ui.grid(columns=3).classes('w-full gap-6'):
         for server in servers:
-            with ui.card().classes('w-full q-mb-md'):
-                with ui.row().classes('items-center justify-between w-full'):
-                    ui.label(server.name).classes('text-xl font-bold')
-                    server.status_label = ui.label("Stopped").classes('text-red font-bold')
+            with ui.card().classes('w-full p-0 flex flex-col gap-0 shadow-sm border border-slate-200 hover:shadow-md transition-shadow duration-300'):
+                # Card Header
+                with ui.row().classes('w-full p-4 items-center justify-between border-b border-slate-100 bg-white'):
+                    with ui.row().classes('items-center gap-3'):
+                        ui.icon('terminal', color='blue-grey').classes('opacity-75')
+                        ui.label(server.name).classes('font-bold text-slate-700 text-lg')
 
-                with ui.expansion('Configuration', icon='settings').classes('w-full'):
-                    with ui.column().classes('w-full'):
-                        ui.input('App Instance Name', value=server.config.app_name, on_change=lambda e, s=server: setattr(s.config, 'app_name', e.value)).classes('w-full').props('placeholder="e.g. mcp"')
-                        ui.number('Port', value=server.config.port, on_change=lambda e, s=server: setattr(s.config, 'port', int(e.value))).classes('w-full')
+                    server.status_indicator = ui.icon('circle').props(f'color={"green" if server.is_running else "grey"} size=xs')
 
-                        use_https = ui.checkbox('Use HTTPS', value=server.config.use_https, on_change=lambda e, s=server: setattr(s.config, 'use_https', e.value))
+                # Card Body
+                with ui.column().classes('p-4 gap-4 bg-white flex-grow'):
+                    with ui.row().classes('w-full justify-between items-center text-sm'):
+                        ui.label('Status').classes('text-slate-400 font-medium')
+                        server.status_label = ui.label("RUNNING" if server.is_running else "STOPPED").classes(
+                            'font-bold ' + ('text-green-500' if server.is_running else 'text-grey-500')
+                        )
 
-                        # Bind visibility to checkbox value
-                        with ui.column().bind_visibility_from(use_https, 'value'):
-                            ui.input('SSL Cert Path', value=server.config.ssl_cert_path, on_change=lambda e, s=server: setattr(s.config, 'ssl_cert_path', e.value)).classes('w-full')
-                            ui.input('SSL Key Path', value=server.config.ssl_key_path, on_change=lambda e, s=server: setattr(s.config, 'ssl_key_path', e.value)).classes('w-full')
+                    with ui.row().classes('w-full justify-between items-center text-sm'):
+                        ui.label('Port').classes('text-slate-400 font-medium')
+                        ui.label(str(server.config.port)).classes('text-slate-700 font-mono bg-slate-100 px-2 py-0.5 rounded')
 
-                with ui.row().classes('q-mt-md'):
-                    ui.button('Start', on_click=server.start).props('color=green')
-                    ui.button('Stop', on_click=server.stop).props('color=red')
+                    with ui.row().classes('w-full justify-between items-center text-sm'):
+                        ui.label('Protocol').classes('text-slate-400 font-medium')
+                        proto = "HTTPS" if server.config.use_https else "HTTP"
+                        ui.label(proto).classes('text-slate-700 font-mono bg-slate-100 px-2 py-0.5 rounded')
 
-                with ui.expansion('Logs', icon='article').classes('w-full q-mt-md'):
-                    server.log_container = ui.scroll_area().classes('h-64 w-full bg-gray-100 p-2 border rounded')
-                    # Render existing logs
-                    with server.log_container:
-                        for log in server.logs:
-                            ui.label(log).style('font-family: monospace; white-space: pre-wrap;')
+                    ui.separator().classes('my-1')
 
-    server_list()
+                    # Action Buttons
+                    with ui.row().classes('w-full gap-2'):
+                        start_btn = ui.button('Start', on_click=server.start, color='green-600' if not server.is_running else 'green-200').props('unelevated no-caps dense w-full').classes('flex-1')
+                        start_btn.bind_enabled_from(server, 'is_running', backward=lambda x: not x)
+
+                        stop_btn = ui.button('Stop', on_click=server.stop, color='red-600' if server.is_running else 'red-200').props('unelevated no-caps dense w-full').classes('flex-1')
+                        stop_btn.bind_enabled_from(server, 'is_running')
+
+                # Card Footer (Tools)
+                with ui.row().classes('w-full p-2 bg-slate-50 border-t border-slate-100 justify-end gap-2'):
+                    ui.button(icon='settings', on_click=lambda s=server: open_config_dialog(s)).props('flat round dense color=slate-500').tooltip('Configure')
+                    ui.button(icon='article', on_click=lambda s=server: open_log_dialog(s)).props('flat round dense color=slate-500').tooltip('View Logs')
+
+
+def open_config_dialog(server: Server):
+    with ui.dialog() as dialog, ui.card().classes('w-96 p-6'):
+        with ui.row().classes('w-full items-center justify-between q-mb-md'):
+            ui.label(f'Configure {server.name}').classes('text-xl font-bold text-slate-800')
+            ui.button(icon='close', on_click=dialog.close).props('flat round dense color=grey')
+
+        with ui.column().classes('w-full gap-4'):
+            ui.input('App Instance Name', value=server.config.app_name,
+                     on_change=lambda e: setattr(server.config, 'app_name', e.value)).classes('w-full').props('outlined dense placeholder="e.g. mcp"')
+
+            ui.number('Port', value=server.config.port,
+                      on_change=lambda e: setattr(server.config, 'port', int(e.value))).classes('w-full').props('outlined dense')
+
+            with ui.row().classes('items-center justify-between w-full border p-3 rounded border-slate-200'):
+                ui.label('Enable HTTPS').classes('text-slate-700 font-medium')
+                use_https = ui.switch('', value=server.config.use_https,
+                                      on_change=lambda e: setattr(server.config, 'use_https', e.value))
+
+            with ui.column().classes('w-full gap-2').bind_visibility_from(use_https, 'value'):
+                ui.label('SSL Certificates').classes('text-xs font-bold text-slate-400 uppercase tracking-wider')
+                ui.input('Cert Path', value=server.config.ssl_cert_path,
+                         on_change=lambda e: setattr(server.config, 'ssl_cert_path', e.value)).classes('w-full').props('outlined dense')
+                ui.input('Key Path', value=server.config.ssl_key_path,
+                         on_change=lambda e: setattr(server.config, 'ssl_key_path', e.value)).classes('w-full').props('outlined dense')
+
+        with ui.row().classes('w-full justify-end q-mt-lg'):
+            ui.button('Save & Close', on_click=dialog.close, color='blue-600').props('unelevated no-caps')
+
+    dialog.open()
+
+def open_log_dialog(server: Server):
+    with ui.dialog() as dialog, ui.card().classes('w-[800px] h-[600px] p-0 flex flex-col overflow-hidden'):
+        # Header
+        with ui.row().classes('w-full items-center justify-between p-4 bg-slate-900 text-white'):
+            with ui.row().classes('items-center gap-2'):
+                ui.icon('terminal', size='sm')
+                ui.label(f'{server.name} - Console Output').classes('font-mono font-bold')
+            ui.button(icon='close', on_click=dialog.close).props('flat round dense color=white')
+
+        # Log Area
+        server.log_container = ui.scroll_area().classes('flex-grow bg-[#1e1e1e] p-4 w-full')
+
+        # Render existing logs
+        with server.log_container:
+            for log in server.logs:
+                ui.label(log).style('font-family: "Fira Code", monospace; font-size: 0.85rem; line-height: 1.2; color: #d4d4d4;')
+
+    dialog.open()
+
 
 if __name__ in {"__main__", "__mp_main__"}:
-    ui.run(title="MCP Dashboard", port=8080)
+    ui.run(title="MCP Enterprise Manager", port=8080)
