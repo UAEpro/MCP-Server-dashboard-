@@ -1,9 +1,10 @@
 import asyncio
 import glob
+import json
 import os
 import sys
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, asdict
+from typing import List, Optional, Dict
 from nicegui import ui, app
 
 # Ensure mcp_servers directory exists
@@ -18,11 +19,33 @@ class ServerConfig:
     ssl_cert_path: str = ""
     ssl_key_path: str = ""
 
+CONFIG_FILE = "mcp_servers/config.json"
+
+def load_configs() -> Dict[str, dict]:
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_configs():
+    data = {}
+    for server in servers:
+        data[server.name] = asdict(server.config)
+
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
+
 class Server:
-    def __init__(self, filepath: str):
+    def __init__(self, filepath: str, saved_config: dict = None):
         self.filepath = filepath
         self.name = os.path.basename(filepath).replace(".py", "")
-        self.config = ServerConfig()
+        if saved_config:
+            self.config = ServerConfig(**saved_config)
+        else:
+            self.config = ServerConfig()
         self.process: Optional[asyncio.subprocess.Process] = None
         self.logs: List[str] = []
         self.log_container = None
@@ -133,12 +156,50 @@ def scan_servers():
     global servers
     files = glob.glob("mcp_servers/*.py")
     current_filepaths = {s.filepath for s in servers}
+    saved_configs = load_configs()
 
     for f in files:
         if f not in current_filepaths:
-            servers.append(Server(f))
+            name = os.path.basename(f).replace(".py", "")
+            servers.append(Server(f, saved_configs.get(name)))
 
 scan_servers()
+
+def create_new_server(name: str):
+    if not name:
+        ui.notify("Server name cannot be empty", type='negative')
+        return
+
+    filename = name.strip().replace(" ", "_").lower()
+    if not filename.endswith(".py"):
+        filename += ".py"
+
+    filepath = os.path.join("mcp_servers", filename)
+    if os.path.exists(filepath):
+        ui.notify(f"Server {filename} already exists", type='negative')
+        return
+
+    content = f'''from fastmcp import FastMCP
+
+# Create an MCP server
+mcp = FastMCP("{name}")
+
+@mcp.tool()
+def hello_world() -> str:
+    """A simple hello world tool"""
+    return "Hello from {name}!"
+
+if __name__ == "__main__":
+    mcp.run()
+'''
+    try:
+        with open(filepath, 'w') as f:
+            f.write(content)
+        ui.notify(f"Created {filename}", type='positive')
+        scan_servers()
+        server_grid.refresh()
+    except Exception as e:
+        ui.notify(f"Error creating file: {e}", type='negative')
 
 # -- UI Components --
 
@@ -166,9 +227,8 @@ def layout():
                     ui.label(label).classes('font-medium')
 
             nav_item('Dashboard', 'dashboard', active=True)
-            nav_item('Configuration', 'settings')
-            nav_item('Logs', 'history')
-            nav_item('Users', 'group')
+            # nav_item('Configuration', 'settings') # Future global settings
+            # nav_item('Logs', 'history') # Future global logs
 
             ui.separator().classes('my-4')
 
@@ -190,10 +250,23 @@ def main_page():
                 ui.label('Server Overview').classes('text-2xl font-bold text-slate-800')
                 ui.label('Manage and monitor your MCP instances').classes('text-sm text-slate-500')
 
-            ui.button('New Server', icon='add', color='blue-600').props('unelevated no-caps')
+            ui.button('New Server', icon='add', color='blue-600', on_click=open_new_server_dialog).props('unelevated no-caps')
 
         # Server Grid
         server_grid()
+
+def open_new_server_dialog():
+    with ui.dialog() as dialog, ui.card().classes('w-96 p-6'):
+        with ui.row().classes('w-full items-center justify-between q-mb-md'):
+            ui.label('Create New Server').classes('text-xl font-bold text-slate-800')
+            ui.button(icon='close', on_click=dialog.close).props('flat round dense color=grey')
+
+        name_input = ui.input('Server Name', placeholder='e.g. Weather Agent').classes('w-full').props('outlined dense autofocus')
+
+        with ui.row().classes('w-full justify-end q-mt-lg'):
+            ui.button('Create', on_click=lambda: (create_new_server(name_input.value), dialog.close()), color='blue-600').props('unelevated no-caps')
+
+    dialog.open()
 
 @ui.refreshable
 def server_grid():
@@ -254,26 +327,31 @@ def open_config_dialog(server: Server):
             ui.button(icon='close', on_click=dialog.close).props('flat round dense color=grey')
 
         with ui.column().classes('w-full gap-4'):
+            # Wrapper to auto-save on change
+            def update_config(attr, value):
+                setattr(server.config, attr, value)
+                save_configs()
+
             ui.input('App Instance Name', value=server.config.app_name,
-                     on_change=lambda e: setattr(server.config, 'app_name', e.value)).classes('w-full').props('outlined dense placeholder="e.g. mcp"')
+                     on_change=lambda e: update_config('app_name', e.value)).classes('w-full').props('outlined dense placeholder="e.g. mcp"')
 
             ui.number('Port', value=server.config.port,
-                      on_change=lambda e: setattr(server.config, 'port', int(e.value))).classes('w-full').props('outlined dense')
+                      on_change=lambda e: update_config('port', int(e.value))).classes('w-full').props('outlined dense')
 
             with ui.row().classes('items-center justify-between w-full border p-3 rounded border-slate-200'):
                 ui.label('Enable HTTPS').classes('text-slate-700 font-medium')
                 use_https = ui.switch('', value=server.config.use_https,
-                                      on_change=lambda e: setattr(server.config, 'use_https', e.value))
+                                      on_change=lambda e: update_config('use_https', e.value))
 
             with ui.column().classes('w-full gap-2').bind_visibility_from(use_https, 'value'):
                 ui.label('SSL Certificates').classes('text-xs font-bold text-slate-400 uppercase tracking-wider')
                 ui.input('Cert Path', value=server.config.ssl_cert_path,
-                         on_change=lambda e: setattr(server.config, 'ssl_cert_path', e.value)).classes('w-full').props('outlined dense')
+                         on_change=lambda e: update_config('ssl_cert_path', e.value)).classes('w-full').props('outlined dense')
                 ui.input('Key Path', value=server.config.ssl_key_path,
-                         on_change=lambda e: setattr(server.config, 'ssl_key_path', e.value)).classes('w-full').props('outlined dense')
+                         on_change=lambda e: update_config('ssl_key_path', e.value)).classes('w-full').props('outlined dense')
 
         with ui.row().classes('w-full justify-end q-mt-lg'):
-            ui.button('Save & Close', on_click=dialog.close, color='blue-600').props('unelevated no-caps')
+            ui.button('Done', on_click=dialog.close, color='blue-600').props('unelevated no-caps')
 
     dialog.open()
 
