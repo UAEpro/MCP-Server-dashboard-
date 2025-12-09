@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 *.log
+.nicegui/
+logs/
+mcp_servers/config.json

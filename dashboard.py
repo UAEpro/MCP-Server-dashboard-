@@ -78,14 +78,14 @@ class Server:
         self.status_indicator = None
         self.status_label = None
 
+        # UI Elements references for updates
+        self.start_btn = None
+        self.stop_btn = None
+
         # Metrics
         self.cpu_history: List[float] = []
         self.mem_history: List[float] = []
         self.metrics_chart = None
-
-        # Start background health monitor for this server
-        ui.timer(5.0, self.check_health)
-        ui.timer(2.0, self.update_metrics)
 
     @property
     def is_running(self):
@@ -259,13 +259,27 @@ class Server:
 
     def update_ui_state(self):
         # Update the specific UI elements for this server
+        running = self.is_running
+
         if self.status_indicator:
-            color = 'green' if self.is_running else 'grey'
+            color = 'green' if running else 'grey'
             self.status_indicator.props(f'color={color}')
 
         if self.status_label:
-            self.status_label.text = "RUNNING" if self.is_running else "STOPPED"
-            self.status_label.classes(replace='text-green-500' if self.is_running else 'text-grey-500')
+            self.status_label.text = "RUNNING" if running else "STOPPED"
+            self.status_label.classes(replace='text-green-500' if running else 'text-grey-500')
+
+        if self.start_btn:
+            if running:
+                self.start_btn.disable()
+            else:
+                self.start_btn.enable()
+
+        if self.stop_btn:
+            if running:
+                self.stop_btn.enable()
+            else:
+                self.stop_btn.disable()
 
 
 servers: List[Server] = []
@@ -542,6 +556,18 @@ def remove_server(server: Server):
         ui.notify(f"Removed {server.name}", type='positive')
         ui.open('/settings') # Refresh page
 
+async def monitor_servers():
+    while True:
+        for server in servers:
+            try:
+                await server.check_health()
+                await server.update_metrics()
+            except Exception as e:
+                print(f"Error monitoring {server.name}: {e}")
+        await asyncio.sleep(2.0)
+
+app.on_startup(monitor_servers)
+
 @ui.refreshable
 def server_grid():
     if not servers:
@@ -582,11 +608,13 @@ def server_grid():
 
                     # Action Buttons
                     with ui.row().classes('w-full gap-2'):
-                        start_btn = ui.button('Start', on_click=server.start, color='green-600' if not server.is_running else 'green-200').props('unelevated no-caps dense w-full').classes('flex-1')
-                        start_btn.bind_enabled_from(server, 'is_running', backward=lambda x: not x)
+                        server.start_btn = ui.button('Start', on_click=server.start, color='green-600').props('unelevated no-caps dense w-full').classes('flex-1')
+                        if server.is_running:
+                            server.start_btn.disable()
 
-                        stop_btn = ui.button('Stop', on_click=server.stop, color='red-600' if server.is_running else 'red-200').props('unelevated no-caps dense w-full').classes('flex-1')
-                        stop_btn.bind_enabled_from(server, 'is_running')
+                        server.stop_btn = ui.button('Stop', on_click=server.stop, color='red-600').props('unelevated no-caps dense w-full').classes('flex-1')
+                        if not server.is_running:
+                            server.stop_btn.disable()
 
                 # Card Footer (Tools)
                 with ui.row().classes('w-full p-2 bg-slate-50 border-t border-slate-100 justify-end gap-2'):
@@ -719,7 +747,11 @@ async def open_inspector_dialog(server: Server):
 
         # Async load tools
         try:
-            url = f"http://localhost:{server.config.port}/sse"
+            protocol = "https" if server.config.use_https else "http"
+            url = f"{protocol}://localhost:{server.config.port}/sse"
+
+            # Note: If self-signed certs are used, sse_client might raise SSL errors.
+            # Currently mcp.client.sse doesn't easily expose ssl_context overrides.
             async with sse_client(url) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
